@@ -13,9 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-// nlohmann::json single-header library required:
-// https://github.com/nlohmann/json (place json.hpp in include path)
-#include "nlohmann/json.hpp"
+#include "json.hpp"
 
 using json = nlohmann::json;
 using namespace std::chrono;
