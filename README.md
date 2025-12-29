@@ -29,15 +29,15 @@ python3 client.py
 ```
 
 then on client you can see your nodeid:
-![alt text](image-1.png)
+![alt text](https://github.com/neitoroxin/p2p/raw/image-1.png)
 on another client connect using command:
 ```bash
 connect <another_node_id>
 ```
 make sure the connection is correct using command `list`:
-![alt text](image-2.png)
+![alt text](https://github.com/neitoroxin/p2p/raw/image-2.png)
 
 send message using command `send <node_id> "message"`
-![alt text](image-3.png)
+![alt text](https://github.com/neitoroxin/p2p/raw/image-3.png)
 
 disconnect server, and enjoy :)
