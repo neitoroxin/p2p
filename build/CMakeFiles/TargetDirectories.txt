@@ -1,0 +1,4 @@
+/home/neitoroxin/p2p/build/CMakeFiles/client.dir
+/home/neitoroxin/p2p/build/CMakeFiles/server.dir
+/home/neitoroxin/p2p/build/CMakeFiles/edit_cache.dir
+/home/neitoroxin/p2p/build/CMakeFiles/rebuild_cache.dir

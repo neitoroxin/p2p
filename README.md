@@ -13,22 +13,31 @@ sudo ufw reload
 sudo iptables -A INPUT -p tcp --dport 55555 -j ACCEPT
 ```
 
+## Build with cmake
+
+```bash
+git clone https://github.com/neitoroxin/p2p.git
+cd p2p
+rm -rf build
+mkdir build
+cd build
+cmake ..
+cmake --build .
+```
+
+### start backend on your server
+```bash
+./server
+```
+
+### start frontend on your pc
+```bash
+./client
+```
+
 ## How to use
-on server download and start `server.py`:
-```bash
-git clone https://github.com/neitoroxin/p2p.git
-cd p2p
-python3 server.py
-```
 
-on client download and start 'client.py':
-```bash
-git clone https://github.com/neitoroxin/p2p.git
-cd p2p
-python3 client.py
-```
-
-then on client you can see your nodeid:
+on client you can see your nodeid:
 ![alt text](https://github.com/neitoroxin/p2p/blob/main/raw/image-1.png)
 on another client connect using command:
 ```bash
