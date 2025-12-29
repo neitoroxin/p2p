@@ -1,8 +1,4 @@
 // client.cpp
-// P2P client with hole punching and direct confirmation
-// Usage: compile and run; set SERVER_IP to your server public IP
-// Requires nlohmann::json single-header "json.hpp"
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -18,8 +14,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <condition_variable>
+#include <memory>
+#include <set>
 
-// include nlohmann json header (place json.hpp in same dir)
 #include "json.hpp"
 using json = nlohmann::json;
 
@@ -51,7 +49,6 @@ double now_seconds() {
 }
 
 std::string make_node_id() {
-    // generate 8-char hex id
     std::random_device rd;
     std::mt19937_64 gen(rd());
     uint64_t v = gen();
@@ -83,10 +80,6 @@ void send_json_to(const sockaddr_in &addr, const json &obj) {
     }
 }
 
-void send_raw_to(const sockaddr_in &addr, const json &obj) {
-    send_json_to(addr, obj);
-}
-
 void send_raw_tuple(const std::pair<std::string,int> &target, const json &obj) {
     sockaddr_in sa = make_sockaddr(target.first, target.second);
     send_json_to(sa, obj);
@@ -106,11 +99,191 @@ void register_and_stun(int local_port) {
     send_raw_server(reg);
 }
 
+// Forward declarations
 void send_direct_test_ping(const std::string &peer_id);
-// forward declarations
-void send_direct_test_ping(const std::string &peer_id);
-bool send_message(const std::string &peer_id, const std::string &text);
+bool send_message_direct(const std::string &peer_id, const std::string &text);
+void route_message_along_path(const std::vector<std::string> &path, const std::string &text);
+std::vector<std::string> distributed_find(const std::string &target, int ttl = 6, int timeout_seconds = 5);
 
+struct SearchState {
+    std::vector<std::string> path; // path from requester to target (including both)
+    bool found = false;
+    std::shared_ptr<std::condition_variable> cv;
+    SearchState() : cv(std::make_shared<std::condition_variable>()) {}
+};
+
+std::mutex search_mutex;
+std::map<std::string, SearchState> pending_searches; // key = target_id
+
+void handle_find_request(const json &msg, const sockaddr_in &addr) {
+    std::string requester = msg.value("requester", "");
+    std::string target = msg.value("target", "");
+    int ttl = msg.value("ttl", 6);
+
+    std::vector<std::string> visited;
+    if (msg.contains("visited") && msg["visited"].is_array()) {
+        for (auto &v : msg["visited"]) visited.push_back(v.get<std::string>());
+    }
+
+    std::string via = msg.value("via", "");
+    if (via.empty()) {
+        // try to match by addr to known peer id
+        auto addr_pair = sockaddr_to_pair(addr);
+        std::lock_guard<std::mutex> g(peers_mutex);
+        for (auto &kv : peers) {
+            if (kv.second.has_public && kv.second.public_addr == addr_pair) { via = kv.first; break; }
+            if (kv.second.has_direct && kv.second.direct_addr == addr_pair) { via = kv.first; break; }
+        }
+    }
+
+    // avoid loops
+    for (auto &v : visited) if (v == NODE_ID) return;
+
+    // append self
+    visited.push_back(NODE_ID);
+
+    // If I am the target -> send find_response back to sender (via addr)
+    if (NODE_ID == target) {
+        json resp = {
+            {"type","find_response"},
+            {"requester", requester},
+            {"target", target},
+            {"path", visited}
+        };
+        send_json_to(addr, resp);
+        return;
+    }
+
+    // If I know the target directly, respond with path = visited + [target]
+    {
+        std::lock_guard<std::mutex> g(peers_mutex);
+        if (peers.find(target) != peers.end()) {
+            std::vector<std::string> path = visited;
+            path.push_back(target);
+            json resp = {
+                {"type","find_response"},
+                {"requester", requester},
+                {"target", target},
+                {"path", path}
+            };
+            send_json_to(addr, resp);
+            return;
+        }
+    }
+
+    if (ttl <= 0) return;
+
+    // Collect neighbors to forward to (exclude via and visited)
+    std::vector<std::string> neighbors;
+    {
+        std::lock_guard<std::mutex> g(peers_mutex);
+        for (auto &kv : peers) {
+            const std::string &pid = kv.first;
+            if (pid == via) continue;
+            bool skip = false;
+            for (auto &v : visited) if (v == pid) { skip = true; break; }
+            if (skip) continue;
+            const PeerInfo &info = kv.second;
+            if (info.direct_confirmed && info.has_direct) neighbors.push_back(pid);
+            else if (info.has_direct) neighbors.push_back(pid);
+            else if (info.has_public) neighbors.push_back(pid);
+        }
+    }
+
+    if (neighbors.empty()) return;
+
+    json fwd = {
+        {"type","find_request"},
+        {"requester", requester},
+        {"target", target},
+        {"visited", visited},
+        {"ttl", ttl - 1},
+        {"via", NODE_ID}
+    };
+
+    for (auto &n : neighbors) {
+        std::pair<std::string, int> addr_pair;
+        {
+            std::lock_guard<std::mutex> g(peers_mutex);
+            PeerInfo info = peers[n];
+            if (info.direct_confirmed && info.has_direct) addr_pair = info.direct_addr;
+            else if (info.has_direct) addr_pair = info.direct_addr;
+            else addr_pair = info.public_addr;
+        }
+        send_raw_tuple(addr_pair, fwd);
+    }
+}
+
+void handle_find_response(const json &msg, const sockaddr_in &addr) {
+    std::string requester = msg.value("requester", "");
+    std::string target = msg.value("target", "");
+    std::vector<std::string> path;
+    if (msg.contains("path") && msg["path"].is_array()) {
+        for (auto &v : msg["path"]) path.push_back(v.get<std::string>());
+    }
+
+    // if I am the requester, store result and notify waiting thread
+    if (requester == NODE_ID) {
+        std::lock_guard<std::mutex> g(search_mutex);
+        auto &st = pending_searches[target];
+        st.path = path;
+        st.found = true;
+        st.cv->notify_all();
+        return;
+    }
+
+    // Otherwise, forward the response back toward the requester along the reverse of path
+    int pos = -1;
+    for (size_t i = 0; i < path.size(); ++i) if (path[i] == NODE_ID) { pos = (int)i; break; }
+    if (pos <= 0) {
+        // not on path or we are requester (handled above)
+        return;
+    }
+    std::string prev = path[pos - 1];
+    std::pair<std::string,int> addr_pair;
+    {
+        std::lock_guard<std::mutex> g(peers_mutex);
+        if (peers.find(prev) == peers.end()) return;
+        PeerInfo info = peers[prev];
+        if (info.direct_confirmed && info.has_direct) addr_pair = info.direct_addr;
+        else if (info.has_direct) addr_pair = info.direct_addr;
+        else addr_pair = info.public_addr;
+    }
+    send_raw_tuple(addr_pair, msg);
+}
+
+void forward_message_by_route(const json &msg) {
+    // expects msg contains "route" array and "to" target id
+    if (!msg.contains("route") || !msg["route"].is_array()) return;
+    std::vector<std::string> route;
+    for (auto &v : msg["route"]) route.push_back(v.get<std::string>());
+    std::string target = msg.value("to", "");
+    // find my position
+    int pos = -1;
+    for (size_t i = 0; i < route.size(); ++i) if (route[i] == NODE_ID) { pos = (int)i; break; }
+    if (pos == -1) {
+        // not on route; ignore
+        return;
+    }
+    if (pos == (int)route.size() - 1) {
+        // I'm the target; deliver locally (already printed by message handler)
+        return;
+    }
+    std::string next = route[pos + 1];
+    std::pair<std::string,int> addr_pair;
+    {
+        std::lock_guard<std::mutex> g(peers_mutex);
+        if (peers.find(next) == peers.end()) {
+            std::cout << "Next hop unknown: " << next << "\n";
+            return;
+        }
+        PeerInfo info = peers[next];
+        if (info.direct_confirmed && info.has_direct) addr_pair = info.direct_addr;
+        else if (info.has_direct) addr_pair = info.direct_addr;
+        else addr_pair = info.public_addr;
+    }
+    send_raw_tuple(addr_pair, msg);
+}
 
 void handle_msg(const json &msg, const sockaddr_in &addr) {
     std::string t = msg.value("type", "");
@@ -139,7 +312,6 @@ void handle_msg(const json &msg, const sockaddr_in &addr) {
             std::string ip = from_public[0].get<std::string>();
             int port = from_public[1].get<int>();
             std::cout << "Incoming punch from " << from_node << " at " << ip << ":" << port << "\n";
-            // reply immediately to public address to help hole punching
             json reply = {{"type","hole_punch"}, {"node_id", NODE_ID}, {"peer_id", from_node}, {"timestamp", now_seconds()}};
             sockaddr_in target = make_sockaddr(ip, port);
             send_json_to(target, reply);
@@ -151,9 +323,7 @@ void handle_msg(const json &msg, const sockaddr_in &addr) {
             std::string ip = peer_public[0].get<std::string>();
             int port = peer_public[1].get<int>();
             std::cout << "Punch coordinates for " << peer_id << ": " << ip << ":" << port << "\n";
-            // start active hole punching attempts
             std::thread([peer_id, ip, port]() {
-                // perform_hole_punch
                 std::cout << "Starting hole punch to " << peer_id << " at " << ip << ":" << port << "\n";
                 {
                     std::lock_guard<std::mutex> g(peers_mutex);
@@ -177,10 +347,8 @@ void handle_msg(const json &msg, const sockaddr_in &addr) {
         std::string peer_id = msg.value("node_id", "");
         auto addr_pair = sockaddr_to_pair(addr);
         std::cout << "Received hole_punch from " << peer_id << " via " << addr_pair.first << ":" << addr_pair.second << "\n";
-        // reply directly to sender address to establish mapping
         json resp = {{"type","hole_punch_response"}, {"node_id", NODE_ID}, {"peer_id", peer_id}, {"timestamp", now_seconds()}};
         send_json_to(addr, resp);
-        // record direct_addr candidate
         {
             std::lock_guard<std::mutex> g(peers_mutex);
             PeerInfo &p = peers[peer_id];
@@ -192,7 +360,6 @@ void handle_msg(const json &msg, const sockaddr_in &addr) {
     } else if (t == "hole_punch_response") {
         auto addr_pair = sockaddr_to_pair(addr);
         std::cout << "Received hole_punch_response from " << addr_pair.first << ":" << addr_pair.second << "\n";
-        // match by addr to known peer public or direct
         std::string matched;
         {
             std::lock_guard<std::mutex> g(peers_mutex);
@@ -222,19 +389,42 @@ void handle_msg(const json &msg, const sockaddr_in &addr) {
         std::string content = msg.value("content", "");
         auto addr_pair = sockaddr_to_pair(addr);
         std::cout << "\nMessage from " << sender << ": " << content << " (addr " << addr_pair.first << ":" << addr_pair.second << ")\n";
-        if (content == "__direct_test_ping__") {
-            // reply with pong
-            send_message(sender, "__direct_test_pong__");
-        } else if (content == "__direct_test_pong__") {
-            std::lock_guard<std::mutex> g(peers_mutex);
-            if (peers.find(sender) != peers.end()) {
-                peers[sender].direct_confirmed = true;
-                peers[sender].last_seen = now_seconds();
-                std::cout << "✅ Direct confirmed with " << sender << "\n";
+
+        // If message contains route, forward automatically if needed
+        if (msg.contains("route") && msg["route"].is_array()) {
+            // If I'm not the final target, forward to next hop
+            std::vector<std::string> route;
+            for (auto &v : msg["route"]) route.push_back(v.get<std::string>());
+            std::string final_target = msg.value("to", "");
+            int pos = -1;
+            for (size_t i = 0; i < route.size(); ++i) if (route[i] == NODE_ID) { pos = (int)i; break; }
+            if (pos != -1 && pos < (int)route.size() - 1) {
+                // forward
+                forward_message_by_route(msg);
+            } else if (pos == (int)route.size() - 1) {
+                // I'm the target: deliver (already printed)
+            } else {
+                // not on route: ignore
+            }
+        } else {
+            // no route: normal direct message
+            if (content == "__direct_test_ping__") {
+                send_message_direct(sender, "__direct_test_pong__");
+            } else if (content == "__direct_test_pong__") {
+                std::lock_guard<std::mutex> g(peers_mutex);
+                if (peers.find(sender) != peers.end()) {
+                    peers[sender].direct_confirmed = true;
+                    peers[sender].last_seen = now_seconds();
+                    std::cout << "✅ Direct confirmed with " << sender << "\n";
+                }
             }
         }
     } else if (t == "relayed") {
         std::cout << "Relayed message from " << msg.value("from","") << ": " << msg.value("content","") << "\n";
+    } else if (t == "find_request") {
+        handle_find_request(msg, addr);
+    } else if (t == "find_response") {
+        handle_find_response(msg, addr);
     } else if (t == "pong") {
         // server pong - ignore
     } else {
@@ -244,7 +434,7 @@ void handle_msg(const json &msg, const sockaddr_in &addr) {
 
 void recv_loop() {
     while (running) {
-        char buf[4096];
+        char buf[8192];
         sockaddr_in cliaddr;
         socklen_t len = sizeof(cliaddr);
         ssize_t n = recvfrom(sockfd, buf, sizeof(buf)-1, 0, (sockaddr*)&cliaddr, &len);
@@ -288,7 +478,7 @@ void send_direct_test_ping(const std::string &peer_id) {
     send_raw_tuple(target, msg);
 }
 
-bool send_message(const std::string &peer_id, const std::string &text) {
+bool send_message_direct(const std::string &peer_id, const std::string &text) {
     PeerInfo info;
     {
         std::lock_guard<std::mutex> g(peers_mutex);
@@ -320,6 +510,108 @@ bool send_message(const std::string &peer_id, const std::string &text) {
     send_raw_server(relay);
     std::cout << "Sent via server relay to " << peer_id << "\n";
     return true;
+}
+
+// route message hop-by-hop along path (path is sequence requester ... target)
+void route_message_along_path(const std::vector<std::string> &path, const std::string &text) {
+    if (path.size() < 2) return;
+    // find my position
+    int pos = -1;
+    for (size_t i = 0; i < path.size(); ++i) if (path[i] == NODE_ID) { pos = (int)i; break; }
+    if (pos == -1) {
+        // not on path; if we are the requester, send to next hop (path[1])
+        return;
+    }
+    if (pos == (int)path.size() - 1) {
+        // I'm the target; deliver locally
+        std::cout << "Delivered locally: " << text << "\n";
+        return;
+    }
+    // next hop is path[pos+1]
+    std::string next = path[pos+1];
+    std::pair<std::string,int> addr_pair;
+    {
+        std::lock_guard<std::mutex> g(peers_mutex);
+        if (peers.find(next) == peers.end()) {
+            std::cout << "Next hop unknown: " << next << "\n";
+            return;
+        }
+        PeerInfo info = peers[next];
+        if (info.direct_confirmed && info.has_direct) addr_pair = info.direct_addr;
+        else if (info.has_direct) addr_pair = info.direct_addr;
+        else addr_pair = info.public_addr;
+    }
+    json msg = {
+        {"type","message"},
+        {"from", NODE_ID},
+        {"to", path.back()},
+        {"content", text},
+        {"route", path}
+    };
+    send_raw_tuple(addr_pair, msg);
+    std::cout << "Forwarded message to next hop " << next << "\n";
+}
+
+// Initiate distributed DFS to find target. Waits up to timeout_seconds for result.
+// Returns path (requester ... target) if found, empty otherwise.
+std::vector<std::string> distributed_find(const std::string &target, int ttl, int timeout_seconds) {
+    {
+        std::lock_guard<std::mutex> g(search_mutex);
+        pending_searches.erase(target);
+        pending_searches[target] = SearchState();
+    }
+
+    // If we already know target locally, return direct path
+    {
+        std::lock_guard<std::mutex> g(peers_mutex);
+        if (peers.find(target) != peers.end()) {
+            std::vector<std::string> p = {NODE_ID, target};
+            std::lock_guard<std::mutex> g2(search_mutex);
+            pending_searches[target].path = p;
+            pending_searches[target].found = true;
+            pending_searches[target].cv->notify_all();
+            return p;
+        }
+    }
+
+    // Build initial visited list with requester
+    std::vector<std::string> visited = {NODE_ID};
+
+    // Send find_request to all neighbors
+    json req = {
+        {"type","find_request"},
+        {"requester", NODE_ID},
+        {"target", target},
+        {"visited", visited},
+        {"ttl", ttl},
+        {"via", NODE_ID}
+    };
+
+    {
+        std::lock_guard<std::mutex> g(peers_mutex);
+        for (auto &kv : peers) {
+            const std::string &pid = kv.first;
+            const PeerInfo &info = kv.second;
+            if (pid == NODE_ID) continue;
+            std::pair<std::string,int> addr_pair;
+            if (info.direct_confirmed && info.has_direct) addr_pair = info.direct_addr;
+            else if (info.has_direct) addr_pair = info.direct_addr;
+            else if (info.has_public) addr_pair = info.public_addr;
+            else continue;
+            send_raw_tuple(addr_pair, req);
+        }
+    }
+
+    // wait for response
+    std::unique_lock<std::mutex> lk(search_mutex);
+    auto &st = pending_searches[target];
+    if (!st.found) {
+        st.cv->wait_for(lk, std::chrono::seconds(timeout_seconds), [&st]{ return st.found; });
+    }
+    if (st.found) return st.path;
+    // not found
+    pending_searches.erase(target);
+    return {};
 }
 
 void peer_keepalive_loop() {
@@ -369,7 +661,54 @@ void input_loop() {
             }
             std::string peer = line.substr(5, p1-5);
             std::string text = line.substr(p1+1);
-            send_message(peer, text);
+
+            // If we have direct info, send directly
+            {
+                std::lock_guard<std::mutex> g(peers_mutex);
+                if (peers.find(peer) != peers.end() && (peers[peer].has_direct || peers[peer].has_public)) {
+                    if (send_message_direct(peer, text)) continue;
+                }
+            }
+
+            // Otherwise run distributed DFS to find route
+            std::cout << "Searching route to " << peer << " ...\n";
+            auto path = distributed_find(peer, 6, 5); // ttl=6, timeout=5s
+            if (path.empty()) {
+                std::cout << "Route not found to " << peer << "\n";
+                continue;
+            }
+            std::cout << "Route found: ";
+            for (size_t i = 0; i < path.size(); ++i) {
+                if (i) std::cout << " -> ";
+                std::cout << path[i];
+            }
+            std::cout << "\n";
+
+            // send message from requester to first hop (path[1])
+            if (path.size() >= 2) {
+                std::string first_hop = path[1];
+                std::pair<std::string,int> addr_pair;
+                {
+                    std::lock_guard<std::mutex> g(peers_mutex);
+                    if (peers.find(first_hop) == peers.end()) {
+                        std::cout << "First hop unknown\n";
+                        continue;
+                    }
+                    PeerInfo info = peers[first_hop];
+                    if (info.direct_confirmed && info.has_direct) addr_pair = info.direct_addr;
+                    else if (info.has_direct) addr_pair = info.direct_addr;
+                    else addr_pair = info.public_addr;
+                }
+                json msg = {
+                    {"type","message"},
+                    {"from", NODE_ID},
+                    {"to", peer},
+                    {"content", text},
+                    {"route", path}
+                };
+                send_raw_tuple(addr_pair, msg);
+                std::cout << "Sent to first hop " << first_hop << "\n";
+            }
         } else if (line.rfind("send_relay ", 0) == 0) {
             size_t p1 = line.find(' ', 11);
             if (p1 == std::string::npos) {
